@@ -92,20 +92,33 @@ def list_models(repo):
     except Exception as e:
         return gr.update(choices=[], value=None), f"❌ {e}"
 
+def _infer_info_html(cfg, skip):
+    skip = int(skip or 0)
+    nf = cfg["backbone"]["num_frames"]
+    return (f"<div style='font-size:12px;color:#555;padding:6px 10px;background:#f7f7f7;border-radius:6px;'>"
+            f"<b>Window:</b> 16 frames &nbsp;·&nbsp; <b>Stride:</b> 4 frames &nbsp;·&nbsp; "
+            f"<b>Skip:</b> {skip} (window spans {16 * (skip + 1)} frames) &nbsp;·&nbsp; "
+            f"<b>Model frames:</b> {nf} &nbsp;·&nbsp; "
+            f"<b>Backbone:</b> {cfg['backbone']['name']}</div>")
+
 def _post_load_updates(cfg):
+    """Updates after a model loads: behavior toggles, info line, and the frame
+    skip dropdown set to the skip recorded in the model's config (0 if none)."""
     names = cfg["class_names"]
     toggle_choices = [nm for nm in names if nm.lower() not in ("others", "other")]
     S["disabled_classes"] = set()
-    nf = cfg["backbone"]["num_frames"]
-    info_html = (f"<div style='font-size:12px;color:#555;padding:6px 10px;background:#f7f7f7;border-radius:6px;'>"
-                 f"<b>Window:</b> 16 frames &nbsp;·&nbsp; <b>Stride:</b> 4 frames &nbsp;·&nbsp; "
-                 f"<b>Model frames:</b> {nf} &nbsp;·&nbsp; "
-                 f"<b>Backbone:</b> {cfg['backbone']['name']}</div>")
+    skip = cfg.get("frame_skip", 0)
     return (
         gr.update(choices=toggle_choices, value=toggle_choices, visible=True),
         _html_behavior_toggles(cfg),
-        info_html,
+        _infer_info_html(cfg, skip),
+        gr.update(value=skip),
     )
+
+def on_skip_change(skip):
+    if not S.get("cfg"):
+        return gr.update()
+    return _infer_info_html(S["cfg"], skip)
 
 def _html_behavior_toggles(cfg):
     if not cfg:
@@ -123,7 +136,7 @@ def _html_behavior_toggles(cfg):
 
 def load_model_hf(repo, model_name):
     if not model_name or not repo:
-        return "❌ Specify repo & model", U, "", ""
+        return "❌ Specify repo & model", U, "", "", U
     try:
         if "/" in model_name or not model_name.endswith(".pth"):
             cfg_file = f"{model_name}/config.json"
@@ -135,37 +148,37 @@ def load_model_hf(repo, model_name):
             raw = json.load(f)
         cfg, err = normalize_config(raw)
         if err:
-            return f"❌ {err}", U, "", ""
+            return f"❌ {err}", U, "", "", U
         pth_path = hf_hub_download(repo_id=repo, filename=pth_file)
         model = build_model_from_config(cfg)
         model.load_state_dict(torch.load(pth_path, map_location=device, weights_only=True))
         model.to(device).eval()
         S.update({"model": model, "cfg": cfg, "results": {}, "done": [], "cur": None, "vr": None, "model_source": "hf"})
-        toggle_upd, toggle_html, infer_info = _post_load_updates(cfg)
+        toggle_upd, toggle_html, infer_info, skip_upd = _post_load_updates(cfg)
         return (f"✅ Loaded from HuggingFace!\n"
                 f"  Model: {model_name}\n"
                 f"  Backbone: {cfg['backbone']['name']} | Frames: {cfg['backbone']['num_frames']}\n"
                 f"  Classes ({len(cfg['class_names'])}): {cfg['class_names']}\n"
                 f"  Device: {device}",
-                toggle_upd, toggle_html, infer_info)
+                toggle_upd, toggle_html, infer_info, skip_upd)
     except Exception as e:
-        return f"❌ {e}", U, "", ""
+        return f"❌ {e}", U, "", "", U
 
 def load_model_local(local_dir, pth_name):
     if not pth_name or not local_dir:
-        return "❌ Select a local model", U, "", ""
+        return "❌ Select a local model", U, "", "", U
     pth_path = os.path.join(local_dir, pth_name)
     if not os.path.exists(pth_path):
-        return f"❌ File not found: {pth_path}", U, "", ""
+        return f"❌ File not found: {pth_path}", U, "", "", U
     try:
         cfg, cfg_source, err = find_config_for_pth(pth_path)
         if err:
-            return f"❌ {err}\n\n💡 Place a config.json or <name>_config.json in same folder.", U, "", ""
+            return f"❌ {err}\n\n💡 Place a config.json or <name>_config.json in same folder.", U, "", "", U
         model = build_model_from_config(cfg)
         model.load_state_dict(torch.load(pth_path, map_location=device, weights_only=True))
         model.to(device).eval()
         S.update({"model": model, "cfg": cfg, "results": {}, "done": [], "cur": None, "vr": None, "model_source": "local"})
-        toggle_upd, toggle_html, infer_info = _post_load_updates(cfg)
+        toggle_upd, toggle_html, infer_info, skip_upd = _post_load_updates(cfg)
         size_mb = os.path.getsize(pth_path) / 1024**2
         return (f"✅ Loaded local model!\n"
                 f"  File: {pth_name} ({size_mb:.1f} MB)\n"
@@ -173,10 +186,10 @@ def load_model_local(local_dir, pth_name):
                 f"  Backbone: {cfg['backbone']['name']} | Frames: {cfg['backbone']['num_frames']}\n"
                 f"  Classes ({len(cfg['class_names'])}): {cfg['class_names']}\n"
                 f"  Device: {device}",
-                toggle_upd, toggle_html, infer_info)
+                toggle_upd, toggle_html, infer_info, skip_upd)
     except Exception as e:
         import traceback
-        return f"❌ Load failed: {e}\n\n{traceback.format_exc()}", U, "", ""
+        return f"❌ Load failed: {e}\n\n{traceback.format_exc()}", U, "", "", U
 
 def scan_local_models(local_dir):
     if not local_dir or not os.path.isdir(local_dir):
@@ -625,7 +638,7 @@ def cancel_inference():
     S["_cancel_inference"] = True
     return "<p style='color:#e74c3c;font-weight:600;'>⛔ Cancelling… will stop after current window.</p>"
 
-def run_single(vf, num_workers, cache_local):
+def run_single(vf, num_workers, cache_local, skip=0):
     S["_cancel_inference"] = False
     vdir = S.get("_active_vdir")
     if not S["model"]: yield "", "", None, "", "", "", "❌ Load model first", U, S["_cursor_data"]; return
@@ -643,7 +656,7 @@ def run_single(vf, num_workers, cache_local):
 
     t0 = time.perf_counter()
     result = None
-    for msg in infer_video_gen(infer_vdir, vf, S["model"], S["cfg"], S["disabled_classes"]):
+    for msg in infer_video_gen(infer_vdir, vf, S["model"], S["cfg"], S["disabled_classes"], skip=int(skip or 0)):
         if S["_cancel_inference"]:
             yield "<p style='color:#e74c3c;font-weight:600;'>⛔ Inference cancelled.</p>", U, U, U, U, U, U, U, U
             print(f"⛔ Inference cancelled: {vf}")
@@ -665,7 +678,7 @@ def run_single(vf, num_workers, cache_local):
     if vf not in S["done"]: S["done"].append(vf)
     yield _full(vf, 0, 1, 1)
 
-def run_batch(num_workers, cache_local):
+def run_batch(num_workers, cache_local, skip=0):
     S["_cancel_inference"] = False
     vdir = S.get("_active_vdir")
     if not S["model"]: yield "", "", None, "", "", "", "❌ Load model first", U, S["_cursor_data"], ""; return
@@ -708,7 +721,7 @@ def run_batch(num_workers, cache_local):
         infer_vdir = cache_map.get(vf, vdir)
         t0 = time.perf_counter()
         result = None
-        for msg in infer_video_gen(infer_vdir, vf, S["model"], S["cfg"], S["disabled_classes"]):
+        for msg in infer_video_gen(infer_vdir, vf, S["model"], S["cfg"], S["disabled_classes"], skip=int(skip or 0)):
             if S["_cancel_inference"]:
                 blog.append(f"⛔ Cancelled during {vf}")
                 yield "<p style='color:#e74c3c;font-weight:600;'>⛔ Batch cancelled.</p>", U, U, U, U, U, U, U, U, "\n".join(blog)
@@ -1131,6 +1144,9 @@ with gr.Blocks(title="Animal Behavior Inference", theme=GREEN_THEME, css=CUSTOM_
                 batch_log_tb = gr.Textbox(label="Batch log", interactive=False, lines=6)
             with gr.Accordion("⚙️ Advanced settings", open=False):
                 infer_info_html = gr.HTML("<p style='color:#aaa;font-size:12px;'>Load a model to see window/stride settings</p>")
+                skip_in = gr.Dropdown(label="Frame skip", choices=[0, 1, 2], value=0, interactive=True,
+                                      info="Frames skipped between sampled frames (0 = consecutive). "
+                                           "Set automatically from the model's config when a model is loaded.")
                 nw_in = gr.Slider(minimum=0, maximum=8, step=1, value=0,
                                   label="Num workers (data loading)",
                                   info="0 = main thread only. Windows: keep at 0 to avoid freezes.")
@@ -1167,9 +1183,10 @@ with gr.Blocks(title="Animal Behavior Inference", theme=GREEN_THEME, css=CUSTOM_
                     eth_log = gr.Textbox(label="Ethogram log", interactive=False, lines=4)
 
     demo.load(list_models, [repo_in], [hf_model_dd, model_st])
-    hf_load_btn.click(load_model_hf, [repo_in, hf_model_dd], [model_st, behavior_toggles, toggle_label_html, infer_info_html])
+    hf_load_btn.click(load_model_hf, [repo_in, hf_model_dd], [model_st, behavior_toggles, toggle_label_html, infer_info_html, skip_in])
     local_scan_btn.click(scan_local_models, [local_dir_in], [local_model_dd, model_st_local])
-    local_load_btn.click(load_model_local, [local_dir_in, local_model_dd], [model_st_local, behavior_toggles, toggle_label_html, infer_info_html])
+    local_load_btn.click(load_model_local, [local_dir_in, local_model_dd], [model_st_local, behavior_toggles, toggle_label_html, infer_info_html, skip_in])
+    skip_in.change(on_skip_change, [skip_in], [infer_info_html])
     behavior_toggles.change(on_toggle_change, [behavior_toggles], [toggle_status])
 
     # Shared outputs for demo/load folder. batch_prog is FIRST so Drive-loading
@@ -1193,9 +1210,9 @@ with gr.Blocks(title="Animal Behavior Inference", theme=GREEN_THEME, css=CUSTOM_
     out9 = [batch_prog, info_html, frame_img, timeline_html, behavior_html, exp_prev, nav_md_out, scrubber, cursor_state]
     out10 = out9 + [batch_log_tb]
 
-    run_btn.click(run_single, [video_dd, nw_in, cache_local_cb], out9) \
+    run_btn.click(run_single, [video_dd, nw_in, cache_local_cb, skip_in], out9) \
            .then(render_ethograms_gallery, None, eth_imgs)
-    batch_btn.click(run_batch, [nw_in, cache_local_cb], out10) \
+    batch_btn.click(run_batch, [nw_in, cache_local_cb, skip_in], out10) \
              .then(render_ethograms_gallery, None, eth_imgs)
     cancel_btn.click(cancel_inference, [], [batch_prog])
     scrubber.input(fn=None, inputs=[scrubber, cursor_state], outputs=[scrubber], js=CURSOR_JS)

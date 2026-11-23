@@ -116,7 +116,25 @@ def normalize_config(raw):
     if cfg["num_classes"] != len(cfg["class_names"]):
         cfg["num_classes"] = len(cfg["class_names"])
 
+    # Frame skip the model was trained with. Configs written before this
+    # setting existed don't record it, so they fall back to 0.
+    cfg["frame_skip"] = _read_frame_skip(raw)
+
     return cfg, None
+
+
+FRAME_SKIP_CHOICES = (0, 1, 2)
+
+
+def _read_frame_skip(raw):
+    """Return training_params.skip from a raw config, or 0 if absent/invalid."""
+    tp = raw.get("training_params")
+    val = tp.get("skip", 0) if isinstance(tp, dict) else 0
+    try:
+        val = int(val)
+    except (TypeError, ValueError):
+        return 0
+    return val if val in FRAME_SKIP_CHOICES else 0
 
 
 def find_config_for_pth(pth_path):
