@@ -19,11 +19,19 @@ from models import build_model_from_config
 from config_utils import normalize_config, find_config_for_pth
 from inference import preprocess, infer_video_gen, remap_with_disabled, get_others_idx
 import precrop
+import file_sniff
 
 _COPY_TAIL_RE = r"(?:\s*的副本|\s*-\s*副本|\s*副本|\s*—\s*副本|\s*-?\s*[Cc]opy|\s*-?\s*copy\s*\d*|\s*\(\d+\))*"
 def _is_video(fname):
     import re
     return bool(re.search(r"(\.mp4|\.avi|\.mov)"+_COPY_TAIL_RE+r"$", fname.lower()))
+
+def _list_videos(vdir):
+    """Video file names in vdir. A file counts as a video by its extension,
+    or — when its name has no extension at all — by its content."""
+    return sorted(f for f in os.listdir(vdir)
+                  if _is_video(f)
+                  or file_sniff.kind_if_no_extension(vdir, f) == file_sniff.VIDEO)
 
 # ==================== 👇 修改這裡 👇 ====================
 HF_REPO_ID         = "yiheng266/animal-social-models"
@@ -278,7 +286,7 @@ def scan_videos_and_preview(vdir):
     if not vdir or not os.path.isdir(vdir):
         yield "", *empty
         return
-    v = sorted([f for f in os.listdir(vdir) if _is_video(f)])
+    v = _list_videos(vdir)
     if not v:
         yield "", gr.update(choices=[], value=None), "❌ No videos", None, "", \
               gr.update(maximum=0, value=0), "", S["_cursor_data"]
@@ -683,7 +691,7 @@ def run_batch(num_workers, cache_local, skip=0):
     vdir = S.get("_active_vdir")
     if not S["model"]: yield "", "", None, "", "", "", "❌ Load model first", U, S["_cursor_data"], ""; return
     if not vdir or not os.path.isdir(vdir): yield "", "", None, "", "", "", "❌ Load videos first", U, S["_cursor_data"], ""; return
-    vids = sorted([f for f in os.listdir(vdir) if _is_video(f)])
+    vids = _list_videos(vdir)
     if not vids: yield "", "", None, "", "", "", "❌ No videos", U, S["_cursor_data"], ""; return
     ws = S["cfg"]["backbone"]["num_frames"] if S.get("cfg") else None
     total = len(vids); blog = []

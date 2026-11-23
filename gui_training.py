@@ -10,6 +10,7 @@ MAX_LABELS = 15  # pre-built dropdown slots
 
 import os, json, threading, numpy as np, torch, torch.nn as nn, torch.optim as optim
 import precrop
+import file_sniff
 import gradio as gr, pandas as pd, random, shutil, time, traceback
 from PIL import Image, ImageFilter
 from torchvision.transforms import ToTensor
@@ -1051,6 +1052,34 @@ def _has_ext(fname, exts):
     return False
 
 
+VIDEO_EXTS = (".mp4", ".avi", ".mov")
+
+
+def _list_videos(d):
+    """Video file names in folder d. A file counts as a video by its
+    extension, or — when its name has no extension at all — by its content."""
+    return sorted(f for f in os.listdir(d)
+                  if _has_ext(f, VIDEO_EXTS)
+                  or file_sniff.kind_if_no_extension(d, f) == file_sniff.VIDEO)
+
+
+def _label_lookup(ldir):
+    """Map lowercased label stem -> full path for every label file in ldir.
+
+    Label files are recognised by the .csv extension, or — when the name has
+    no extension — by content. Extension-less labels are also registered
+    under their name minus Drive's duplicate marker, so a video "0022"
+    finds a label that the Drive mount shows as "0022 (1)"."""
+    names = os.listdir(ldir)
+    out = {_clean_stem(f, (".csv",)).lower(): os.path.join(ldir, f)
+           for f in names if _has_ext(f, (".csv",))}
+    for f in sorted(names):
+        if file_sniff.kind_if_no_extension(ldir, f) == file_sniff.TABLE:
+            for stem in _strip_suffixes(f):
+                out.setdefault(stem.lower(), os.path.join(ldir, f))
+    return out
+
+
 def _clean_stem(fname, exts):
     """Return the filename stem with the extension AND any trailing copy
     marker removed. 'F-1223-3.csv 的副本' -> 'F-1223-3'."""
@@ -1143,12 +1172,11 @@ def do_scan_and_preview(vdir, ldir, val_pct, val_seed, head_mode, *dd_vals):
     if not vdir or not os.path.isdir(vdir): return empty(f"❌ Video dir not found")
     if not ldir or not os.path.isdir(ldir): return empty(f"❌ Label dir not found")
 
-    vfiles=sorted([f for f in os.listdir(vdir) if _has_ext(f, (".mp4",".avi",".mov"))])
+    vfiles=_list_videos(vdir)
     if not vfiles: return empty("❌ No videos found")
 
-    # Build a lookup of all CSV files in label dir for flexible matching
-    csv_files = {_clean_stem(f, (".csv",)).lower(): os.path.join(ldir, f)
-                 for f in os.listdir(ldir) if _has_ext(f, (".csv",))}
+    # Build a lookup of all label files in label dir for flexible matching
+    csv_files = _label_lookup(ldir)
 
     matched=[]; all_label_names=None
     boris_count=0; onehot_count=0
@@ -1952,13 +1980,11 @@ def scan_val_folder(val_vdir, val_ldir):
     if not val_ldir or not os.path.isdir(val_ldir):
         return [], f"❌ Val label dir not found: {val_ldir}"
 
-    vfiles = sorted([f for f in os.listdir(val_vdir)
-                     if _has_ext(f, (".mp4", ".avi", ".mov"))])
+    vfiles = _list_videos(val_vdir)
     if not vfiles:
         return [], "❌ No videos in val folder"
 
-    csv_files = {_clean_stem(f, (".csv",)).lower(): os.path.join(val_ldir, f)
-                 for f in os.listdir(val_ldir) if _has_ext(f, (".csv",))}
+    csv_files = _label_lookup(val_ldir)
 
     entries = []
     for vf in vfiles:
@@ -2161,10 +2187,12 @@ def build_val_ethogram(epoch, vf):
     except Exception:
         return None
 
-    lp = None
-    for entry in (S.get("scan_data") or []):
-        if entry.get("vp") == vp:
-            lp = entry.get("lp"); break
+    # the label file this video was validated against, recorded at training time
+    lp = (d.get("label_paths") or {}).get(vp)
+    if lp is None:
+        for entry in (S.get("scan_data") or []):
+            if entry.get("vp") == vp:
+                lp = entry.get("lp"); break
     if lp is None:
         # separate val folder: not in scan_data, so fall back to a same-named csv
         base = os.path.splitext(vf)[0]
@@ -2689,6 +2717,7 @@ def run_training(repo,mname,vdir,ldir,odir,head_mode,
                     "names": list(new_names),
                     "label_map": dict(label_map),
                     "skip": skip,
+                    "label_paths": {vps[i]: lps[i] for i in vidx},
                 }
             except Exception as e:
                 print(f"⚠️ Could not store val windows: {e}")
