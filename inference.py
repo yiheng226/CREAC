@@ -91,7 +91,7 @@ def remap_with_disabled(pred_label, probs, cfg, disabled_classes):
 
 # ====================== Sliding-Window Inference ======================
 
-def infer_video_gen(vdir, vf, model, cfg, disabled_classes=None, yield_every=5):
+def infer_video_gen(vdir, vf, model, cfg, disabled_classes=None, yield_every=5, skip=0):
     """
     Run sliding-window inference on a single video file.
 
@@ -105,6 +105,10 @@ def infer_video_gen(vdir, vf, model, cfg, disabled_classes=None, yield_every=5):
         cfg: normalized config dict
         disabled_classes: set of class indices to merge into 'others'
         yield_every: int, yield progress every N windows
+        skip: int, frames skipped between sampled frames (0 = consecutive).
+            Each window still samples 16 frames; with skip=1 they are
+            frames s, s+2, ..., s+30. The window's prediction is applied to
+            every frame it spans, skipped frames included.
 
     Yields:
         (int, int) — progress
@@ -115,8 +119,11 @@ def infer_video_gen(vdir, vf, model, cfg, disabled_classes=None, yield_every=5):
         disabled_classes = set()
 
     device = next(model.parameters()).device
-    ws = 16                              # window size (fixed, matches training)
-    st = 4                               # stride (fixed)
+    ws = 16                              # frames sampled per window (fixed, matches training)
+    st = 4                               # stride between window starts, in video frames (fixed)
+    step = int(skip or 0) + 1            # gap between sampled frames (1 = consecutive)
+    need = (ws - 1) * step + 1           # video frames needed to sample one full window
+    span = ws * step                     # video frames a window's prediction covers
     nc = cfg["num_classes"]
 
     import os
@@ -132,12 +139,12 @@ def infer_video_gen(vdir, vf, model, cfg, disabled_classes=None, yield_every=5):
 
     votes = [[] for _ in range(T)]
     probs = [[] for _ in range(T)]
-    wins = list(range(0, T - ws + 1, st))
+    wins = list(range(0, T - need + 1, st))
     yield ("prep", 2, 3)
 
     if not wins:
-        # Video shorter than one window — use all frames
-        fr = [Image.fromarray(f) for f in vr.get_batch(list(range(T))).asnumpy()]
+        # Video shorter than one window — use every available sampled frame
+        fr = [Image.fromarray(f) for f in vr.get_batch(list(range(0, T, step))).asnumpy()]
         yield ("prep", 3, 3)
         while len(fr) < ws:
             fr.append(fr[-1])
@@ -153,14 +160,15 @@ def infer_video_gen(vdir, vf, model, cfg, disabled_classes=None, yield_every=5):
     else:
         yield ("prep", 3, 3)
         for wi, s in enumerate(wins):
-            idx = list(range(s, s + ws))
+            idx = list(range(s, s + need, step))
             fr = [Image.fromarray(f) for f in vr.get_batch(idx).asnumpy()]
             with torch.no_grad():
                 p = torch.softmax(
                     model(preprocess(fr, cfg).unsqueeze(0).to(device)), dim=1
                 )[0].cpu().numpy()
             pred, p = remap_with_disabled(int(np.argmax(p)), p, cfg, disabled_classes)
-            for i in idx:
+            # Vote on every frame the window spans, including skipped ones
+            for i in range(s, min(s + span, T)):
                 votes[i].append(pred)
                 probs[i].append(p)
             if (wi + 1) % yield_every == 0 or wi == len(wins) - 1:

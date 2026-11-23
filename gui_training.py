@@ -10,6 +10,7 @@ MAX_LABELS = 15  # pre-built dropdown slots
 
 import os, json, threading, numpy as np, torch, torch.nn as nn, torch.optim as optim
 import precrop
+import file_sniff
 import gradio as gr, pandas as pd, random, shutil, time, traceback
 from PIL import Image, ImageFilter
 from torchvision.transforms import ToTensor
@@ -1051,6 +1052,34 @@ def _has_ext(fname, exts):
     return False
 
 
+VIDEO_EXTS = (".mp4", ".avi", ".mov")
+
+
+def _list_videos(d):
+    """Video file names in folder d. A file counts as a video by its
+    extension, or — when its name has no extension at all — by its content."""
+    return sorted(f for f in os.listdir(d)
+                  if _has_ext(f, VIDEO_EXTS)
+                  or file_sniff.kind_if_no_extension(d, f) == file_sniff.VIDEO)
+
+
+def _label_lookup(ldir):
+    """Map lowercased label stem -> full path for every label file in ldir.
+
+    Label files are recognised by the .csv extension, or — when the name has
+    no extension — by content. Extension-less labels are also registered
+    under their name minus Drive's duplicate marker, so a video "0022"
+    finds a label that the Drive mount shows as "0022 (1)"."""
+    names = os.listdir(ldir)
+    out = {_clean_stem(f, (".csv",)).lower(): os.path.join(ldir, f)
+           for f in names if _has_ext(f, (".csv",))}
+    for f in sorted(names):
+        if file_sniff.kind_if_no_extension(ldir, f) == file_sniff.TABLE:
+            for stem in _strip_suffixes(f):
+                out.setdefault(stem.lower(), os.path.join(ldir, f))
+    return out
+
+
 def _clean_stem(fname, exts):
     """Return the filename stem with the extension AND any trailing copy
     marker removed. 'F-1223-3.csv 的副本' -> 'F-1223-3'."""
@@ -1143,12 +1172,11 @@ def do_scan_and_preview(vdir, ldir, val_pct, val_seed, head_mode, *dd_vals):
     if not vdir or not os.path.isdir(vdir): return empty(f"❌ Video dir not found")
     if not ldir or not os.path.isdir(ldir): return empty(f"❌ Label dir not found")
 
-    vfiles=sorted([f for f in os.listdir(vdir) if _has_ext(f, (".mp4",".avi",".mov"))])
+    vfiles=_list_videos(vdir)
     if not vfiles: return empty("❌ No videos found")
 
-    # Build a lookup of all CSV files in label dir for flexible matching
-    csv_files = {_clean_stem(f, (".csv",)).lower(): os.path.join(ldir, f)
-                 for f in os.listdir(ldir) if _has_ext(f, (".csv",))}
+    # Build a lookup of all label files in label dir for flexible matching
+    csv_files = _label_lookup(ldir)
 
     matched=[]; all_label_names=None
     boris_count=0; onehot_count=0
@@ -1952,13 +1980,11 @@ def scan_val_folder(val_vdir, val_ldir):
     if not val_ldir or not os.path.isdir(val_ldir):
         return [], f"❌ Val label dir not found: {val_ldir}"
 
-    vfiles = sorted([f for f in os.listdir(val_vdir)
-                     if _has_ext(f, (".mp4", ".avi", ".mov"))])
+    vfiles = _list_videos(val_vdir)
     if not vfiles:
         return [], "❌ No videos in val folder"
 
-    csv_files = {_clean_stem(f, (".csv",)).lower(): os.path.join(val_ldir, f)
-                 for f in os.listdir(val_ldir) if _has_ext(f, (".csv",))}
+    csv_files = _label_lookup(val_ldir)
 
     entries = []
     for vf in vfiles:
@@ -2123,8 +2149,9 @@ def build_val_ethogram(epoch, vf):
     ground truth (blue, bottom).
 
     Window predictions (ws=16, stride=4) are scattered back onto every frame
-    they cover; overlaps take a majority vote, matching how inference
-    aggregates. Ground truth is read per-frame from the original label file.
+    they cover (with frame skip, also the skipped frames after each sampled
+    frame); overlaps take a majority vote, matching how inference aggregates.
+    Ground truth is read per-frame from the original label file.
     """
     import tempfile
     import matplotlib
@@ -2160,10 +2187,12 @@ def build_val_ethogram(epoch, vf):
     except Exception:
         return None
 
-    lp = None
-    for entry in (S.get("scan_data") or []):
-        if entry.get("vp") == vp:
-            lp = entry.get("lp"); break
+    # the label file this video was validated against, recorded at training time
+    lp = (d.get("label_paths") or {}).get(vp)
+    if lp is None:
+        for entry in (S.get("scan_data") or []):
+            if entry.get("vp") == vp:
+                lp = entry.get("lp"); break
     if lp is None:
         # separate val folder: not in scan_data, so fall back to a same-named csv
         base = os.path.splitext(vf)[0]
@@ -2183,11 +2212,14 @@ def build_val_ethogram(epoch, vf):
             print(f"⚠️ GT load failed for {vf}: {e}")
 
     # ---- prediction: scatter windows back onto frames, majority vote ----
+    skip = int(d.get("skip", 0) or 0)
     votes = [[] for _ in range(T)]
     for idx_, lbl in win:
         for i in idx_:
-            if 0 <= i < T:
-                votes[i].append(lbl)
+            # each sampled frame also stands for the `skip` frames after it
+            for j in range(i, i + skip + 1):
+                if 0 <= j < T:
+                    votes[j].append(lbl)
     pred = np.array([Counter(v).most_common(1)[0][0] if v else -1 for v in votes])
 
     # ---- plot (excluding Other and excluded frames marked -1) ----
@@ -2369,7 +2401,7 @@ def rescan_after_preprocess(vdir, ldir, val_pct, val_seed, head_mode, *dd_vals):
 
 def run_training(repo,mname,vdir,ldir,odir,head_mode,
                  n_epochs,batch_sz,lr_str,val_pct,val_seed,train_seed,
-                 num_workers,cache_local,
+                 num_workers,cache_local,skip,
                  use_sep_val,val_vdir,val_ldir,
                  aug_blur_frac,aug_tdrop_frac,aug_hflip_p,aug_vflip_p,
                  aug_rot_deg,aug_brightness,aug_contrast,aug_saturation,
@@ -2381,6 +2413,8 @@ def run_training(repo,mname,vdir,ldir,odir,head_mode,
         lr=float(lr_str); val_ratio=float(val_pct)/100.0; n_epochs=int(n_epochs)
         batch_sz=int(batch_sz)
         ws=16; stride_val=4  # fixed window and stride
+        skip=int(skip or 0)  # frames skipped between sampled frames (0 = consecutive)
+        if skip not in FRAME_SKIP_CHOICES: raise ValueError(f"frame skip must be one of {FRAME_SKIP_CHOICES}")
         val_seed=int(val_seed); train_seed=int(train_seed)
         val_seed=int(val_seed); train_seed=int(train_seed)
         num_workers=int(num_workers)
@@ -2498,8 +2532,8 @@ def run_training(repo,mname,vdir,ldir,odir,head_mode,
         fr=temporal_dropout(fr,frac=aug_tdrop_frac)
         return fr
 
-    train_ds=SlidingWindowDataset([vps[i] for i in tidx],[lps[i] for i in tidx],ws,stride_val,cfg,new_nc,label_map,augment=aug)
-    val_ds=SlidingWindowDataset([vps[i] for i in vidx],[lps[i] for i in vidx],ws,stride_val,cfg,new_nc,label_map) if vidx else None
+    train_ds=SlidingWindowDataset([vps[i] for i in tidx],[lps[i] for i in tidx],ws,stride_val,cfg,new_nc,label_map,skip=skip,augment=aug)
+    val_ds=SlidingWindowDataset([vps[i] for i in vidx],[lps[i] for i in vidx],ws,stride_val,cfg,new_nc,label_map,skip=skip) if vidx else None
 
     if len(train_ds)==0: yield "❌ No training windows created.",""; return
 
@@ -2645,7 +2679,7 @@ def run_training(repo,mname,vdir,ldir,odir,head_mode,
             },
             "training_params": {
                 "epochs": n_epochs, "batch_size": batch_sz, "lr": lr,
-                "window_size": ws, "stride": stride_val,
+                "window_size": ws, "stride": stride_val, "skip": skip,
                 "val_seed": val_seed, "train_seed": train_seed,
             },
             "augmentation": {
@@ -2682,6 +2716,8 @@ def run_training(repo,mname,vdir,ldir,odir,head_mode,
                     "pred": np.asarray(ap_, dtype=np.int16),
                     "names": list(new_names),
                     "label_map": dict(label_map),
+                    "skip": skip,
+                    "label_paths": {vps[i]: lps[i] for i in vidx},
                 }
             except Exception as e:
                 print(f"⚠️ Could not store val windows: {e}")
@@ -2830,11 +2866,19 @@ def load_demo_training(repo, val_pct, val_seed, head_mode, *dd_vals):
 
 # ====================== GUI ======================
 
+FRAME_SKIP_CHOICES = (0, 1, 2)
+
+def window_info_html(skip):
+    skip = int(skip or 0)
+    return ("<div style='font-size:12px;color:#555;padding:6px 10px;background:#f7f7f7;border-radius:6px;margin:4px 0;'>"
+            "<b>Window:</b> 16 frames &nbsp;·&nbsp; <b>Stride:</b> 4 frames (fixed) &nbsp;·&nbsp; "
+            f"<b>Skip:</b> {skip} (window spans {16 * (skip + 1)} frames)</div>")
+
 def save_training_config(save_path, head_mode,
                          repo, vdir, ldir, odir, sep_val, val_vdir, val_ldir,
                          pp_enabled, pp_yolo, pp_pad, pp_drive,
                          val_ratio, epochs, batch, lr, val_seed, train_seed,
-                         num_workers, cache_local,
+                         num_workers, cache_local, skip,
                          aug_hflip, aug_vflip, aug_rot, aug_bright, aug_contrast,
                          aug_sat, aug_blur, aug_tdrop, aug_mult, aug_excluded,
                          *map_dds):
@@ -2852,7 +2896,8 @@ def save_training_config(save_path, head_mode,
                        "padding": pp_pad, "drive_out": pp_drive},
         "train": {"val_ratio": val_ratio, "epochs": epochs, "batch": batch,
                   "lr": lr, "val_seed": val_seed, "train_seed": train_seed,
-                  "num_workers": num_workers, "cache_local": bool(cache_local)},
+                  "num_workers": num_workers, "cache_local": bool(cache_local),
+                  "skip": skip},
         "aug": {"hflip": aug_hflip, "vflip": aug_vflip, "rot": aug_rot,
                 "brightness": aug_bright, "contrast": aug_contrast,
                 "saturation": aug_sat, "blur": aug_blur, "tdrop": aug_tdrop,
@@ -2970,8 +3015,8 @@ def load_training_config(load_path):
     N = MAX_LABELS
     # helper to build the full update tuple in a fixed order
     def blanks():
-        # Outputs after cfg_status: 29 scalar widgets + N mapping dropdowns.
-        return [gr.update() for _ in range(29 + N)]
+        # Outputs after cfg_status: 30 scalar widgets + N mapping dropdowns.
+        return [gr.update() for _ in range(30 + N)]
 
     if not load_path or not os.path.isfile(load_path.strip()):
         return (_cfg_card("❌ Config file not found", "#e74c3c"), *blanks())
@@ -2995,7 +3040,7 @@ def load_training_config(load_path):
         U(pp.get("enabled")), U(pp.get("yolo")), U(pp.get("padding")), U(pp.get("drive_out")),
         U(tr.get("val_ratio")), U(tr.get("epochs")), U(tr.get("batch")), U(tr.get("lr")),
         U(tr.get("val_seed")), U(tr.get("train_seed")), U(tr.get("num_workers")),
-        U(tr.get("cache_local")),
+        U(tr.get("cache_local")), U(tr.get("skip")),
         U(ag.get("hflip")), U(ag.get("vflip")), U(ag.get("rot")),
         U(ag.get("brightness")), U(ag.get("contrast")), U(ag.get("saturation")),
         U(ag.get("blur")), U(ag.get("tdrop")), U(ag.get("mult")),
@@ -3145,7 +3190,9 @@ with gr.Blocks(title="Training", theme=YELLOW_THEME, css=CUSTOM_CSS) as demo:
                     bs_in=gr.Number(label="Batch",value=8,precision=0)
                 with gr.Row():
                     lr_in=gr.Textbox(label="LR",value="3.8e-5")
-                gr.HTML("<div style='font-size:12px;color:#555;padding:6px 10px;background:#f7f7f7;border-radius:6px;margin:4px 0;'><b>Window:</b> 16 frames &nbsp;·&nbsp; <b>Stride:</b> 4 frames (fixed)</div>")
+                win_info_html=gr.HTML(window_info_html(0))
+                skip_in=gr.Dropdown(label="Frame skip",choices=list(FRAME_SKIP_CHOICES),value=0,interactive=True,
+                                    info="Frames skipped between sampled frames (0 = consecutive). Saved into the model config.")
                 with gr.Row():
                     val_seed_in=gr.Number(label="Val seed",value=1337,precision=0,info="Split reproducibility")
                     train_seed_in=gr.Number(label="Train seed",value=2025,precision=0,info="Augmentation reproducibility")
@@ -3377,7 +3424,7 @@ with gr.Blocks(title="Training", theme=YELLOW_THEME, css=CUSTOM_CSS) as demo:
         repo_in, vdir_in, ldir_in, odir_in, sep_val_cb, val_vdir_in, val_ldir_in,
         pp_toggle, pp_yolo_in, pp_pad_in, pp_drive_in,
         vr_in, ep_in, bs_in, lr_in, val_seed_in, train_seed_in,
-        nw_in, cache_local_cb,
+        nw_in, cache_local_cb, skip_in,
         aug_hflip_in, aug_vflip_in, aug_rot_in, aug_brightness_in, aug_contrast_in,
         aug_saturation_in, aug_blur_in, aug_tdrop_in, aug_mult_in, aug_excluded_in,
         *map_dds]
@@ -3386,7 +3433,7 @@ with gr.Blocks(title="Training", theme=YELLOW_THEME, css=CUSTOM_CSS) as demo:
     _cfg_load_outputs = [cfg_status, head_mode_dd,
         vdir_in, ldir_in, odir_in, sep_val_cb, val_vdir_in, val_ldir_in,
         pp_toggle, pp_yolo_in, pp_pad_in, pp_drive_in,
-        vr_in, ep_in, bs_in, lr_in, val_seed_in, train_seed_in, nw_in, cache_local_cb,
+        vr_in, ep_in, bs_in, lr_in, val_seed_in, train_seed_in, nw_in, cache_local_cb, skip_in,
         aug_hflip_in, aug_vflip_in, aug_rot_in, aug_brightness_in, aug_contrast_in,
         aug_saturation_in, aug_blur_in, aug_tdrop_in, aug_mult_in, aug_excluded_in,
         *map_dds]
@@ -3413,7 +3460,7 @@ with gr.Blocks(title="Training", theme=YELLOW_THEME, css=CUSTOM_CSS) as demo:
              .then(run_training,
                     [repo_in,model_dd,vdir_in,ldir_in,odir_in,head_mode_dd,
                      ep_in,bs_in,lr_in,vr_in,val_seed_in,train_seed_in,
-                     nw_in,cache_local_cb,
+                     nw_in,cache_local_cb,skip_in,
                      sep_val_cb,val_vdir_in,val_ldir_in,
                      aug_blur_in,aug_tdrop_in,aug_hflip_in,aug_vflip_in,
                      aug_rot_in,aug_brightness_in,aug_contrast_in,aug_saturation_in,
@@ -3426,6 +3473,7 @@ with gr.Blocks(title="Training", theme=YELLOW_THEME, css=CUSTOM_CSS) as demo:
              .then(list_val_videos, [eth_epoch_dd], [eth_vid_dd]) \
              .then(build_val_ethogram, [eth_epoch_dd, eth_vid_dd], [eth_img])
     cancel_btn.click(cancel_training, [], [progress_html])
+    skip_in.change(window_info_html, [skip_in], [win_info_html])
 
     # Threshold analysis: recompute when epoch or granularity changes
     thr_epoch_dd.change(build_threshold_table, [thr_epoch_dd, thr_steps], [thr_html])
