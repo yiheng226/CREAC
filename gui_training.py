@@ -1679,6 +1679,20 @@ def page_mapping_ready(dd_vals):
     return n > 0 and any(v is not None for v in dd_vals[:n])
 
 
+def mark_page_loaded(status):
+    """Per-page flag: did Load folder / Load Demo just succeed on THIS page?
+    Kept in a gr.State, so a refreshed page or a new tab starts as False even
+    though S (server-side) still remembers the last dataset."""
+    return str(status or "").startswith("✅")
+
+
+def keep_or_mark_page_loaded(status, was_loaded):
+    """After the automatic re-scan on Start training: a successful re-scan
+    counts as loaded; a failed one leaves the flag as it was (e.g. demo data,
+    which is not in the folder boxes, stays loaded)."""
+    return True if mark_page_loaded(status) else bool(was_loaded)
+
+
 def apply_mapper_bridge(bridge_json, head_mode, *dd_vals):
     """Bridge JSON (from the visual mapper) → dropdown values.
 
@@ -2424,7 +2438,7 @@ def rescan_after_preprocess(vdir, ldir, val_pct, val_seed, head_mode, *dd_vals):
 
 def run_training(repo,mname,vdir,ldir,odir,head_mode,
                  n_epochs,batch_sz,lr_str,val_pct,val_seed,train_seed,
-                 num_workers,cache_local,skip,
+                 num_workers,cache_local,skip,page_loaded,
                  use_sep_val,val_vdir,val_ldir,
                  aug_blur_frac,aug_tdrop_frac,aug_hflip_p,aug_vflip_p,
                  aug_rot_deg,aug_brightness,aug_contrast,aug_saturation,
@@ -2451,7 +2465,7 @@ def run_training(repo,mname,vdir,ldir,odir,head_mode,
 
     if not S["model"] or not S["cfg"]: yield "❌ Load model first",U; return
     if not S["scan_data"]: yield "❌ Load data first",U; return
-    if not page_mapping_ready(dd_vals):
+    if not page_loaded:
         S["_training_active"] = False   # nothing started; keep the preview usable
         yield ("<p style='color:#e74c3c;font-weight:600;'>❌ No data is loaded on this page — "
                "click 📂 Load folder first, then Start training.</p>"), U
@@ -3102,6 +3116,7 @@ with gr.Blocks(title="Training", theme=YELLOW_THEME, css=CUSTOM_CSS) as demo:
     gr.Markdown("# Animal Behavior Model Training\nFine-tune from pretrained — preview labels & configure mapping before training")
 
     cursor_state = gr.Textbox(value=S["_cursor_data"], visible=False)
+    page_loaded = gr.State(False)   # this page has successfully loaded data
     repo_in = gr.Textbox(value=HF_REPO_ID, visible=False)
 
     with gr.Row():
@@ -3361,6 +3376,7 @@ with gr.Blocks(title="Training", theme=YELLOW_THEME, css=CUSTOM_CSS) as demo:
     _aug_prev_inputs = [head_mode_dd, aug_mult_in, aug_excluded_in, *map_dds]
 
     demo_btn.click(load_demo_training, [repo_in, vr_in, val_seed_in, head_mode_dd, *map_dds], scan_outputs
+                   ).then(mark_page_loaded, [scan_st], [page_loaded]
                    ).then(_initialize_excluded_choices,
                           [head_mode_dd, *map_dds, aug_excluded_in], aug_excluded_in
                    ).then(_seed_mapper, [head_mode_dd, *map_dds], lm_seed
@@ -3368,6 +3384,7 @@ with gr.Blocks(title="Training", theme=YELLOW_THEME, css=CUSTOM_CSS) as demo:
 
     # Load folder → scan user's own directories
     scan_d.click(do_scan_and_preview, [vdir_in, ldir_in, vr_in, val_seed_in, head_mode_dd, *map_dds], scan_outputs
+                 ).then(mark_page_loaded, [scan_st], [page_loaded]
                  ).then(_initialize_excluded_choices,
                         [head_mode_dd, *map_dds, aug_excluded_in], aug_excluded_in
                  ).then(apply_pending_cfg_map, [head_mode_dd, *map_dds],
@@ -3487,10 +3504,11 @@ with gr.Blocks(title="Training", theme=YELLOW_THEME, css=CUSTOM_CSS) as demo:
              .then(rescan_after_preprocess,
                    [vdir_in, ldir_in, vr_in, val_seed_in, head_mode_dd, *map_dds],
                    scan_outputs) \
+             .then(keep_or_mark_page_loaded, [scan_st, page_loaded], [page_loaded]) \
              .then(run_training,
                     [repo_in,model_dd,vdir_in,ldir_in,odir_in,head_mode_dd,
                      ep_in,bs_in,lr_in,vr_in,val_seed_in,train_seed_in,
-                     nw_in,cache_local_cb,skip_in,
+                     nw_in,cache_local_cb,skip_in,page_loaded,
                      sep_val_cb,val_vdir_in,val_ldir_in,
                      aug_blur_in,aug_tdrop_in,aug_hflip_in,aug_vflip_in,
                      aug_rot_in,aug_brightness_in,aug_contrast_in,aug_saturation_in,
