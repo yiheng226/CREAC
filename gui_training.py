@@ -385,13 +385,16 @@ class SlidingWindowDataset(Dataset):
         # NOTE: we open a fresh VideoReader per call. A per-worker cache was tried
         # but decord + torch DataLoader workers have known memory-accumulation issues
         # (see dmlc/decord#280) — caching makes Colab OOM / workers crash silently.
-        vr=VideoReader(vp,ctx=cpu(0))
+        # Decode straight to the model's input size: the decoder scales each
+        # frame as it converts it to RGB, so full-resolution frames (e.g.
+        # 1920x1080) are never copied out. Roughly halves the memory a window
+        # read needs and makes it faster; augmentation then runs on small frames.
+        # Models trained this way are marked in their config (decode_resize) so
+        # inference reads frames the same way.
+        sz=self._input_size
+        vr=VideoReader(vp,ctx=cpu(0),width=sz,height=sz)
         frames=[Image.fromarray(f) for f in vr.get_batch(idx).asnumpy()]
         if len(frames)<self.ws: frames+=[frames[-1]]*(self.ws-len(frames))
-        # Resize EARLY — augmentation runs on 224x224 instead of e.g. 1920x1080.
-        # Rotation / color jitter / blur are ~50-70x faster at small resolution.
-        sz=self._input_size
-        frames=[f.resize((sz,sz),Image.BILINEAR) for f in frames]
         if self.augment: frames=self.augment(frames)
         return preprocess(frames,self.cfg,skip_resize=True),torch.tensor(lbl,dtype=torch.long)
 
@@ -2680,6 +2683,8 @@ def run_training(repo,mname,vdir,ldir,odir,head_mode,
             "training_params": {
                 "epochs": n_epochs, "batch_size": batch_sz, "lr": lr,
                 "window_size": ws, "stride": stride_val, "skip": skip,
+                # frames were decoded directly at input size (see SlidingWindowDataset)
+                "decode_resize": True,
                 "val_seed": val_seed, "train_seed": train_seed,
             },
             "augmentation": {

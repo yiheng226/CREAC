@@ -132,7 +132,13 @@ def infer_video_gen(vdir, vf, model, cfg, disabled_classes=None, yield_every=5, 
     # shared progress card. 3-tuples ("prep", done, total) are distinguishable
     # from the 2-tuple ("windows") progress emitted below.
     yield ("prep", 0, 3)
-    vr = VideoReader(vp, ctx=cpu(0))   # pulls/decodes the file (slow on Drive)
+    if cfg.get("decode_resize"):
+        # Model was trained on frames decoded directly at input size: read the
+        # same way (also avoids copying out full-resolution frames).
+        sz = cfg["backbone"]["input_size"]
+        vr = VideoReader(vp, ctx=cpu(0), width=sz, height=sz)
+    else:
+        vr = VideoReader(vp, ctx=cpu(0))   # pulls/decodes the file (slow on Drive)
     yield ("prep", 1, 3)
     T = len(vr)
     fps = vr.get_avg_fps()

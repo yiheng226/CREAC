@@ -120,6 +120,12 @@ def normalize_config(raw):
     # setting existed don't record it, so they fall back to 0.
     cfg["frame_skip"] = _read_frame_skip(raw)
 
+    # Whether the model was trained on frames decoded directly at input size.
+    # Inference reads frames the same way the model was trained; configs that
+    # don't record it (older models) keep the original full-size read + resize.
+    tp = raw.get("training_params")
+    cfg["decode_resize"] = bool(tp.get("decode_resize", False)) if isinstance(tp, dict) else False
+
     return cfg, None
 
 
