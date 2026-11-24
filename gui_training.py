@@ -1842,18 +1842,17 @@ def _get_frame(vf, fi):
     d=item["entry"]
     with S["_preview_lock"]:
         try:
-            if S["cur_vf"]!=vf or S["cur_vr"] is None:
-                # Explicitly release the old VideoReader before opening a new
-                # one.  The lock prevents a simultaneous preview callback from
-                # deleting the reader while this callback is decoding a frame.
-                old = S.get("cur_vr")
-                if old is not None:
-                    S["cur_vr"] = None
-                    del old
-                    import gc; gc.collect()
-                S["cur_vr"]=VideoReader(d["vp"],ctx=cpu(0)); S["cur_vf"]=vf
-            T=len(S["cur_vr"]); fi=max(0,min(int(fi),T-1))
-            return S["cur_vr"][fi].asnumpy()
+            # Open the video, read the one frame, and close it again. A decord
+            # reader that is left open keeps decoding ahead in the background
+            # and holds the decoded full-size frames (measured: ~2 GB for 1080p
+            # within seconds, 4+ GB after scrubbing), so it is never kept in S.
+            # The lock keeps preview callbacks from decoding at the same time.
+            vr=VideoReader(d["vp"],ctx=cpu(0)); S["cur_vf"]=vf
+            try:
+                T=len(vr); fi=max(0,min(int(fi),T-1))
+                return vr[fi].asnumpy()
+            finally:
+                del vr
         except Exception as e:
             print(f"⚠️ Preview failed for {vf}: {e}")
             S["cur_vr"]=None; S["cur_vf"]=None
