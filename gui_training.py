@@ -1667,6 +1667,18 @@ def _mapper_init_js(data_labels, head_mode, pretrained_names, dd_values):
     return _json.dumps(cfg)
 
 
+def page_mapping_ready(dd_vals):
+    """True when THIS page's label-mapping dropdowns hold the scanned labels.
+
+    S (label names, scan data) lives in the server process and survives a page
+    refresh, a second browser tab, or a later Load folder that failed — but
+    each of those leaves the page's dropdowns empty (no choices, no values).
+    A successful Load folder always gives every label's dropdown a value, so
+    "no values at all" means the page and S are out of step."""
+    n = len(S.get("label_names") or [])
+    return n > 0 and any(v is not None for v in dd_vals[:n])
+
+
 def apply_mapper_bridge(bridge_json, head_mode, *dd_vals):
     """Bridge JSON (from the visual mapper) → dropdown values.
 
@@ -1679,6 +1691,10 @@ def apply_mapper_bridge(bridge_json, head_mode, *dd_vals):
     data_labels = S["label_names"]
     n = len(data_labels)
     if not bridge_json or n == 0:
+        return tuple(gr.update() for _ in range(N))
+    # Never write label values into dropdowns that have no choices on this
+    # page (Gradio rejects them: "Value ... is not in the list of choices: []").
+    if not page_mapping_ready(dd_vals):
         return tuple(gr.update() for _ in range(N))
     try:
         payload = _json.loads(bridge_json)
@@ -1776,6 +1792,11 @@ def on_mapping_change(head_mode, *dd_vals):
     if n == 0:
         # must match map_change_outputs: [*map_dds, timeline_html, cursor_state, mapping_summary]
         return (*[gr.update() for _ in range(N)], "", S["_cursor_data"], "")
+    if not page_mapping_ready(dd_vals):
+        # This page has no scanned labels in its dropdowns (refreshed page, new
+        # tab, or a failed Load folder). Don't refill them from the labels the
+        # server still remembers — leave the page as it is until Load folder.
+        return (*[gr.update() for _ in range(N)], gr.update(), gr.update(), gr.update())
 
     # Parse current values
     cur_vals = list(dd_vals[:N])
@@ -2430,6 +2451,11 @@ def run_training(repo,mname,vdir,ldir,odir,head_mode,
 
     if not S["model"] or not S["cfg"]: yield "❌ Load model first",U; return
     if not S["scan_data"]: yield "❌ Load data first",U; return
+    if not page_mapping_ready(dd_vals):
+        S["_training_active"] = False   # nothing started; keep the preview usable
+        yield ("<p style='color:#e74c3c;font-weight:600;'>❌ No data is loaded on this page — "
+               "click 📂 Load folder first, then Start training.</p>"), U
+        return
 
     cfg=S["cfg"]; data_labels=S["label_names"]
     pretrained_names=cfg["class_names"]
